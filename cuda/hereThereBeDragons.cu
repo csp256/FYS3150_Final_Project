@@ -1,0 +1,941 @@
+// I am including this file solely to show that I did work in CUDA too.
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <curand_kernel.h>
+
+#include <helper_cuda.h>
+
+#include "nvToolsExt.h"
+#include "nvToolsExtCuda.h"
+#include "nvToolsExtCudaRt.h"
+
+#include <dlfcn.h>
+#include <cxxabi.h>
+
+#define PRINTING false
+
+#define tx threadIdx.x
+#define ty threadIdx.y 
+#define bx blockIdx.x
+#define by blockIdx.y
+#define bdx blockDim.x
+#define bdy blockDim.y
+#define gdx gridDim.x
+#define gdy gridDim.y
+
+#define iceil(n,d) ((n-1)/d)+1
+
+#define cudaCheckErrors(msg) \
+   do { \
+      cudaError_t __err = cudaGetLastError();\
+      if (__err != cudaSuccess) { \
+         if (PRINTING) printf("Fatal error %s (%s at %s:%d)\n", msg, cudaGetErrorString(__err), __FILE__, __LINE__); \
+         exit(1); \
+      } \
+   } while (0)
+
+#define idx(particle, dimension) (dimension*N + particle)
+// so all of the "x" dimension values are contiguous 
+
+#define sIdx(column, order) (order*(N/2) + column)
+// please not that here consecutive values {0,1,2} of column correspond to particles {0,2,4} or {1,3,5}
+// that is to say, column is:          (particle>>1)
+
+
+
+#define N 				6
+#define D 				2
+#define ALPHA 			1.0
+#define BETA 			0.4
+#define OMEGA 			1.0
+//#define K2 				(OMEGA * ALPHA)
+//#define K 				(sqrt(K2))
+#define CHARGE 			6
+#define STEP_LENGTH		0.001
+#define h 				0.00001
+#define CYCLES			10000
+
+//#define SEED 124
+#define SEED 1234
+
+
+
+/*
+#define position 		0
+#define magnitude 		(position + N*D)
+#define slaterUp 		(magnitude + N*D)
+#define slaterDown 		(slaterUp + N*N/4)
+#define slaterUpDet 	(slaterDown + N*N/4)
+#define slaterDownDet 	(slaterUpDet + 1)
+#define jastrow 		(slaterDownDet + 1)
+#define wavefunction	(jastrow + 1)
+#define force 			(wavefunction + 1)
+
+#define stateSize		(force + N*D)
+#define stateA			0
+#define stateB 			(stateA + stateSize)
+#define sizeOfSM2		(stateB + stateSize)
+*/
+
+#define oldPosition  			0
+#define newPosition  			(oldPosition + N*D)
+#define oldMagnitude 			(newPosition + N*D)
+#define newMagnitude 			(oldMagnitude + N)
+#define oldSlaterUp				(newMagnitude + N)
+#define newSlaterUp				(oldSlaterUp + N*N/4)
+#define oldSlaterDown			(newSlaterUp + N*N/4)
+#define newSlaterDown			(oldSlaterDown + N*N/4)
+#define oldDoubleGradientSlater	(newSlaterDown + N*N/4)
+#define oldLaplacianSlater		(oldDoubleGradientSlater + D)
+#define oldSlaterUpDeterminant		(oldLaplacianSlater + 1)
+#define oldSlaterDownDeterminant	(oldSlaterUpDeterminant + 1)
+#define oldJastrow 				(oldSlaterDownDeterminant + 1)
+#define oldGradientJastrow 		(oldJastrow + 1)
+#define oldLaplacianJastrow		(oldGradientJastrow + D)			
+#define oldForce				(oldLaplacianJastrow + 1)
+
+#define newDoubleGradientSlater	(oldForce + D)
+#define newLaplacianSlater		(newDoubleGradientSlater + D)
+#define newSlaterUpDeterminant		(newLaplacianSlater + 1)
+#define newSlaterDownDeterminant	(newSlaterUpDeterminant + 1)
+#define newJastrow 				(newSlaterDownDeterminant + 1)
+#define newGradientJastrow 		(newJastrow + 1)
+#define newLaplacianJastrow		(newGradientJastrow + D)
+#define newForce				(newLaplacianJastrow + 1)
+
+#define kineticEnergies			(newForce + D)
+
+#define sizeOfSM				(kineticEnergies + N)
+
+
+#define STEP_LENGTH2	(STEP_LENGTH * STEP_LENGTH)
+// the below is for our finite difference
+#define oneOverH (1.0 / h)
+#define oneOverH2 (oneOverH*oneOverH)
+// the "diffusion constant"
+#define bigD 0.5
+
+
+
+extern __shared__ double S[]; // I swear to god... 
+// http://devblogs.nvidia.com/parallelforall/using-shared-memory-cuda-cc/
+
+
+
+__device__ __forceinline__  double hermite (int order, double x) {
+    switch (order) {
+        case 0:
+            return 1.0;
+        //break; get a compiler warning for including breaks after a return! (i mean, of course you do, but c'mon...)
+        case 1:
+            return x+x; // 2x
+        //break;
+	/*      case 2:
+            return 4*x*x - 2; // 4x^2 - 2
+        break;
+        case 3:
+            return 8*x*x*x - 12*x; // 8x^3 - 12x
+        break;
+        case 4: {
+            double x2 = x*x;
+            return 16*x2*x2 - 48*x2 + 12; // 16x^4 - 48x^2 + 12
+        } break;
+	*/  default:
+            if (PRINTING) printf("ERROR: hermite order %d (x=%f)\n", order, x);
+    }
+    return -1.0;
+}
+
+
+
+// Test passed!
+__device__ double determinant_3x3 (int offset) { 
+	double partial = 0.0;
+	if (tx == 0) {
+		partial = S[offset + 0]  *  (S[offset + 4]*S[offset + 8] - S[offset + 5]*S[offset + 7]);
+	}
+	if (tx == 1) {
+		partial = S[offset + 1]  *  (S[offset + 3]*S[offset + 8] - S[offset + 5]*S[offset + 6]);
+	}
+	if (tx == 2) {
+		partial = S[offset + 2]  *  (S[offset + 3]*S[offset + 7] - S[offset + 6]*S[offset + 4]);		
+	}
+	__syncthreads();
+	partial += __shfl_down(partial, 2);
+	partial -= __shfl_down(partial, 1);
+	// tx should now have the right partial. everything else is garbage.
+	return __shfl (partial, 0);
+}
+
+
+
+
+__device__ double psi(double k, double k2, int orbital, int position, int magnitude) {
+	int nx,ny;
+	if (orbital == 1) { // orbitals are 0-indexed
+		ny = 1;
+	} else {
+		ny = 0;
+	}
+	if (orbital == 2) {
+		nx = 1;
+	} else {
+		nx = 0;
+	}
+	double m = S[magnitude + tx];
+	return hermite(nx, k*S[position + tx]) * hermite(ny, k*S[position + N + tx]) * exp(-0.5 * k2 * m*m); 
+}
+
+
+
+__device__ double a(int i, int j) {
+    if ((i&1) == (j&1)) { // same spin
+    	return 1.0/3.0;
+    } else { // different spin
+        return 1.0;
+    }
+}
+
+
+
+
+__device__ void initializePosition(curandState *RNG_state) {
+	if (tx<N) {
+		double r = 0;
+		double temp;
+		for (int d=0; d<D; ++d) {
+			temp = curand_normal_double(RNG_state);
+			S[oldPosition + d*N + tx] = temp;
+			r += temp * temp;
+		}
+		S[oldMagnitude + tx] = sqrt(r);
+	}
+}
+
+
+// Test passed! 
+__device__ __forceinline__ void moveElectron(int positionBefore, int magnitudeBefore, int positionAfter, int magnitudeAfter, int doubleGradientSlater, int slaterDeterminant, int gradientJastrow, int jastrow, int force, int currentlyMovedElectron, curandState *RNG_state) {
+	if (tx==currentlyMovedElectron) { // this should not be serialized. i mean, really... but that is a worry for later
+		double r = 0.0;
+		double temp;
+		for (int d=0; d<D; ++d) {
+			temp  = S[positionBefore + d*N + tx] + curand_normal_double(RNG_state) * STEP_LENGTH;
+			temp += S[force + d] * bigD * STEP_LENGTH2;
+	//		temp += (S[doubleGradientSlater+d]/S[slaterDeterminant] + 2*S[gradientJastrow+d]/S[jastrow]) * bigD * STEP_LENGTH2;
+			S[positionAfter + d*N + tx] = temp;
+			r += temp * temp;
+		}
+		S[magnitudeAfter + tx] = sqrt(r);
+	} else { // just to be extra-clear
+		if (tx<N) { 
+			for (int d=0; d<D; ++d) {
+				S[positionAfter + d*N + tx] = S[positionBefore + d*N + tx];
+			}
+			S[magnitudeAfter + tx] = S[magnitudeBefore + tx];
+		}
+	}
+}
+
+
+
+__device__ __forceinline__ int updateCurrentElectron(int currentlyMovedElectron) {
+	if (currentlyMovedElectron==N-1) {
+		return 0;
+	} else {
+		return ++currentlyMovedElectron;
+	}
+}
+
+
+
+__device__ void initializeSlaterMatrices(int slaterUp, int slaterDown, int position, int magnitude, double k) {
+	if (tx<N) {
+		int slater;
+		if ((tx & 1) == 0) { // that is to say, all EVEN threads; including the 0th thread
+			slater = slaterUp; // thus EVEN threads are UP threads...
+		} else { // all ODD threads
+			slater = slaterDown; // ... and ODD threads are DOWN threads
+		}
+		for (int orbital=0; orbital<N/2; orbital++) { // the tx/2 on the next line SHOULD return an (int) anyways...
+			S[slater + (int)(tx/2) + orbital*N/2] = psi(k, k*k, orbital, position, magnitude); // change orbital to orbital after test for consistency with usage in psi() 
+		}
+	}
+}
+
+
+__device__ double jastrowFactor(int position, int currentlyMovedElectron, double beta, double dx, double dy) {
+	double jastrowTerm = 0.0;
+	if (tx<N && tx!=currentlyMovedElectron) {
+		double relativeDistance, temp;
+		temp = S[position + 0 + tx] - (S[position + 0 + currentlyMovedElectron] + dx); 
+		relativeDistance = temp * temp;
+		temp = S[position + N + tx] - (S[position + N + currentlyMovedElectron] + dy); 
+		relativeDistance += temp * temp;
+			
+		relativeDistance = sqrt(relativeDistance);
+		jastrowTerm = a(tx,currentlyMovedElectron) * relativeDistance;
+		jastrowTerm /= (1.0 + beta*relativeDistance); // could we FMA this? is it still IEEE compliant?
+	}
+
+	// we need to reduce the jastrow terms... this is the least worst way to do it (not pretty but efficient; brittle, assumes N=6)
+	jastrowTerm += __shfl_down(jastrowTerm,1);
+	jastrowTerm += __shfl_down(jastrowTerm,2);
+	jastrowTerm += __shfl_down(jastrowTerm,4);
+	jastrowTerm = __shfl(jastrowTerm, 0, 8); 
+	return exp(jastrowTerm);
+}
+
+__device__ void jastrowGradientAndLaplacian(int position, int jastrowIndex, int gradientJastrow, int laplacianJastrow, int currentlyMovedElectron, double beta, bool print) {
+	double xPlus 	= jastrowFactor(position, currentlyMovedElectron, beta,  h,  0.0);
+	double xMinus 	= jastrowFactor(position, currentlyMovedElectron, beta, -h,  0.0);
+	if (tx==0) {
+		S[gradientJastrow + 0] = 0.5 * (xPlus - xMinus) * oneOverH;
+	}
+	double yPlus	= jastrowFactor(position, currentlyMovedElectron, beta,  0.0,  h);
+	double yMinus	= jastrowFactor(position, currentlyMovedElectron, beta,  0.0, -h);
+	if (tx==0) {
+		S[gradientJastrow + 1] = 0.5 * (yPlus - yMinus) * oneOverH;
+	}
+	double middle   = jastrowFactor(position, currentlyMovedElectron, beta,  0.0,  0.0);
+	if (tx==0) {
+		S[laplacianJastrow] = (xPlus + xMinus + yPlus + yMinus - 4*middle) * oneOverH2;
+		S[jastrowIndex] = middle;
+	}
+}
+
+	/* We need to calc not just the stuff for the gradient but also the laplacian, while we have things set up. 
+		with importance sampling this should be used ~90% of the time, so it would be more wasteful to assume we 
+		probably won't need the laplacian for discrete energy calculation, and have to reconstruct partial results 
+		(like A,B,C). also, doing everything once wins on simplicity.
+		it is the CALLER'S responsibility for column to be currentlyMovedElectron>>1 */
+__device__ void slaterDeterminantAndGradientAndLaplacian(int slater, int position, int magnitude, int slaterDeterminant, int doubleGradientSlater, int slaterLaplacian, double k, int column, bool print) { 
+	if (tx==0 && print) if (PRINTING) printf(":: :: Inside master slater function. Column = %d\n", column);
+	double A,B,C;
+	switch (column) { // yay! no warp divergence!
+		case 0:
+			A = S[slater+4]*S[slater+8] - S[slater+7]*S[slater+5]; // 4*8 - 7*5   THESE ARE INDICES (top row of the matrix is 0 1 2, middle row is 3 4 5, bottom row is 6 7 8)
+			B = S[slater+1]*S[slater+8] - S[slater+7]*S[slater+2]; // 1*8 - 7*2   THESE ARE INDICES
+			C = S[slater+1]*S[slater+5] - S[slater+2]*S[slater+4]; // 1*5 - 2*4   THESE ARE INDICES (each index that appears should appear twice on these 3 lines)
+		break;
+		case 1: // note the negatives here reflect the assumption of even parity in the code after the switch statement
+			A = -S[slater+3]*S[slater+8] + S[slater+6]*S[slater+5]; // 4*8 - 7*5   THESE ARE INDICES
+			B = -S[slater+0]*S[slater+8] + S[slater+6]*S[slater+2]; // 1*8 - 7*2   THESE ARE INDICES
+			C = -S[slater+0]*S[slater+5] + S[slater+2]*S[slater+3]; // 1*5 - 2*4   THESE ARE INDICES (each index that appears should appear twice on these 3 lines)
+		break; 
+		case 2:
+			A = S[slater+3]*S[slater+7] - S[slater+4]*S[slater+6]; // 4*8 - 7*5   THESE ARE INDICES
+			B = S[slater+0]*S[slater+7] - S[slater+4]*S[slater+6]; // 1*8 - 7*2   THESE ARE INDICES
+			C = S[slater+0]*S[slater+4] - S[slater+1]*S[slater+3]; // 1*5 - 2*4   THESE ARE INDICES (each index that appears should appear twice on these 3 lines)
+		break;
+		default:
+			if (PRINTING) printf("You should never see this message! Something broke!\n");
+		break;
+	}
+
+	double x = S[position +     column];
+	double y = S[position + N + column];
+	if ((tx>>1) == 0) { // threads 0 and 1 handle x
+		if ((tx&1) == 0) { // thread 0 is minus
+			x -= h;
+		} else { // thread 1 is plus
+			x += h;
+		}
+	}
+	if ((tx>>1) == 1) { // threads 2 and 3 handle y
+		if ((tx&1) == 0) { // thread 2 is minus
+			y -= h;
+		} else { // thread 3 is plus
+			y += h;
+		}	
+	}
+	//if (tx == 4) { // thread 4 handles center of 4 point star
+		// but there is nothing to do for that case! x and y are already good.
+	//}
+
+	double expTerm = exp(-0.5 * k * k * (x*x + y*y)); 
+	double determinant = 0.0;
+	determinant += A * hermite(0, k*x) * hermite(0, k*y) * expTerm;
+	determinant -= B * hermite(0, k*x) * hermite(1, k*y) * expTerm; // you can optimize this by writing the hermite polynomials explicitly 
+	determinant += C * hermite(1, k*x) * hermite(0, k*y) * expTerm;
+	// threads 0-3 now hold the slater determinants for the outer 4 points on a 5 point 2D stencil, and thread 4..7 hold the center (duplicates but thats okay)
+
+	if (tx==4) {
+		S[slaterDeterminant] = determinant;
+		if (PRINTING) printf(":: determinant      = %15.15f\n", determinant);
+	}
+
+	if (tx < 4) {
+		// will this still work if we put it in inside the IF below it? Answer: No.
+		double temp = (__shfl_down(determinant, 1, 8) - determinant) * oneOverH;
+		if ((tx&1) == 0) { // if we are thread 0 or 2
+			S[doubleGradientSlater + ((tx&2)>>1)] = temp; // write out twice the x and y components of the gradient of the slater det.
+		} 
+	}
+
+	// now we are going to calculate the laplacian
+	if (tx < 4) {
+		determinant += __shfl_down(determinant, 1, 8);
+		determinant += __shfl_down(determinant, 2, 8); // this line and above computes sum of the 4 outlying points on a QUINCUNX stencil (new favorite word)
+	}
+	determinant -= 4*__shfl_down(determinant, 4, 8); // threads 4..7 should be equal
+
+	if (tx == 0) {
+		S[slaterLaplacian] = determinant * oneOverH2; 
+	}
+}
+
+__device__ double greensFunction(int positionOld, int positionNew, int forceOld, int forceNew, int currentlyMovedElectron) {
+	double gf = 0.0;
+	if (tx<D) { 
+		gf  = 0.5 * (S[forceOld + tx] + S[forceNew + tx]);
+		if (PRINTING) printf("tx=%d : gf1 = %f\n",tx,gf);
+		if (PRINTING) printf("tx=%d : delta = %f\n",tx,S[forceOld + tx] - S[forceNew + tx]);
+		if (PRINTING) printf("tx=%d : pos = %f\n",tx, - S[positionNew + tx*N + currentlyMovedElectron] + S[positionOld + tx*N + currentlyMovedElectron]);
+		gf *= (bigD * STEP_LENGTH2 * 0.5 * (S[forceOld + tx] - S[forceNew + tx]) - S[positionNew + tx*N + currentlyMovedElectron] + S[positionOld + tx*N + currentlyMovedElectron]);
+		if (PRINTING) printf("tx=%d : gf2 = %f\n",tx,gf);
+	}
+	gf += __shfl_down(gf, 1);
+	if (tx==0) {
+		if (PRINTING) printf("tx=%d : gf3 = %f\n",tx,gf);
+		gf = exp(gf);
+		if (PRINTING) printf("tx=%d : gf4 = %f\n",tx,gf);
+	}
+	return gf;
+}
+
+__device__ double dotProductOfGradients(int a, int b) {
+	double sum = 0.0;
+	for (int d=0; d<D; ++d) {
+		sum += S[a+d] * S[b+d];
+	}
+	return sum;
+}
+
+__device__ void updateForce(int doubleGradientSlaterDeterminant, int slaterDeterminant, int gradientJastrow, int jastrow, int force) {
+	if (tx<D) { // breaks terribly due to strange slater determinant bug, so set to 0.
+		S[force + tx]  =  0.0;//S[doubleGradientSlaterDeterminant + tx]/S[slaterDeterminant]  +  2*S[gradientJastrow + tx]/S[jastrow];
+	}
+}
+
+__device__ double localKineticEnergy(int slaterDeterminant, int doubleGradientSlater, int laplacianSlater, int jastrowIndex, int gradientJastrow, int laplacianJastrow) {
+	double laplacianPsiOverPsi;
+	if (tx==0) {
+		laplacianPsiOverPsi  = S[laplacianSlater]    /   S[slaterDeterminant];
+		laplacianPsiOverPsi += S[laplacianJastrow]   /   S[jastrowIndex];
+		laplacianPsiOverPsi += dotProductOfGradients(gradientJastrow, doubleGradientSlater)   /   (S[slaterDeterminant] * S[jastrowIndex]);
+		laplacianPsiOverPsi *= 0.5;
+	}
+	return __shfl(laplacianPsiOverPsi, 0);
+}
+
+__device__ double electronElectronPotentialEnergy(int position) {
+	double energy = 0.0;
+	if (tx<N) {
+		double x = S[position +     tx];
+		double y = S[position + N + tx];
+		#pragma unroll
+		for (int n=0; n<N; n++) {
+			if (tx!=n) {
+				double distance, temp;
+				temp = S[position +     n] - x;
+				distance  = temp * temp;
+				temp = S[position + N + n] - y;
+				distance += temp * temp;
+				distance = sqrt(distance);
+				energy += 1.0/distance;
+			}
+		}
+	}
+
+	energy += __shfl_down(energy, 1, 8);
+	energy += __shfl_down(energy, 2, 8);
+	energy += __shfl_down(energy, 4, 8);
+	energy  = __shfl(energy, 0, 8);
+	return energy;
+}
+
+__device__ double harmonicPotentialEnergy(int position) {
+	double energy = 0.0;
+	double r; 
+	if (tx<N) {
+		for (int d=0; d<D; d++) {
+			r = S[position + d*N + tx];
+			energy += r*r;
+		}
+	}
+	energy += __shfl_down(energy, 1, 8);
+	energy += __shfl_down(energy, 2, 8);
+	energy += __shfl_down(energy, 4, 8);
+	energy  = __shfl(energy, 0, 8);
+	return energy * 0.5 * OMEGA;
+}
+
+__device__ double electronProtonPotentialEnergy(int magnitude) {
+	double energy = 0.0;
+	if (tx<N) {
+		energy = -CHARGE / S[magnitude + tx];
+	}
+	energy += __shfl_down(energy, 1, 8);
+	energy += __shfl_down(energy, 2, 8);
+	energy += __shfl_down(energy, 4, 8);
+	energy  = __shfl(energy, 0, 8);
+	return energy;
+}
+
+__device__ void initializeKineticEnergies() {
+	if (tx<N) {
+		S[kineticEnergies + tx] = 0.0;
+	}
+}
+
+__device__ double sumKineticEnergies() {
+	double energy = 0.0;
+	if (tx<N) {
+		energy = S[kineticEnergies + tx];
+	}
+	energy += __shfl_down(energy, 1, 8);
+	energy += __shfl_down(energy, 2, 8);
+	energy += __shfl_down(energy, 4, 8);
+	energy  = __shfl(energy, 0, 8);
+	return energy;
+}
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+__global__ void VMC_Kernel(double alpha, double beta, double k) {
+	if (PRINTING) printf("\n");
+	int currentlyMovedElectron = 0;
+	int accepted = 0;
+	bool parityReversal = false;
+
+	int UNIQUE_ID = tx; // this must be unique for every thread in every block **for every run** before it is useful! (we are only launching one block per grid now for debugging purposes so it is okay)
+	curandState RNG_state;
+	curand_init(SEED, UNIQUE_ID, 0, &RNG_state);
+
+	// This function is called only this one time. It sets up the oldPosition and oldMagnitude arrays.
+	initializePosition(&RNG_state);
+	initializeKineticEnergies(); 
+	__syncthreads();
+
+	// This fills in the Up and Down matrices. It requires all threads.
+	initializeSlaterMatrices(oldSlaterUp, oldSlaterDown, oldPosition, oldMagnitude, k);
+	__syncthreads();
+
+	// This calculates the Up determinant, the Up gradient, and the Up laplacian. It requires all threads. The last argument is what column is being varied.
+	slaterDeterminantAndGradientAndLaplacian(oldSlaterUp, oldPosition, oldMagnitude, oldSlaterUpDeterminant, oldDoubleGradientSlater, oldLaplacianSlater, k, currentlyMovedElectron>>1, false); 
+	// This calculates the Down determinant. I don't think it is actually needed, but I want to see it. It requires the first 4 threads.
+	S[oldSlaterDownDeterminant] = determinant_3x3(oldSlaterDown);
+	if (tx==0) {
+		if (PRINTING) printf("oldDetUp    = %15.15f\n", S[oldSlaterUpDeterminant]);
+		if (PRINTING) printf("oldDetDown  = %15.15f\n", S[oldSlaterDownDeterminant]);
+		if (PRINTING) printf("oldGradSlater_x    = %15.15f\n", S[oldDoubleGradientSlater]);
+		if (PRINTING) printf("oldGradSlater_y    = %15.15f\n", S[oldDoubleGradientSlater+1]);
+		if (PRINTING) printf("oldLaplacianSlater = %15.15f\n", S[oldLaplacianSlater] );
+	}
+	__syncthreads();
+
+	// This calculates the Jastrow factor, its gradient, and its laplacian. It requires all threads. The last argument controls debugging printing. 
+	jastrowGradientAndLaplacian(oldPosition, oldJastrow, oldGradientJastrow, oldLaplacianJastrow, currentlyMovedElectron, beta, true);
+	if (tx==0) {
+		if (PRINTING) printf("oldJastrow           = %15.15f\n", S[oldJastrow]);
+		if (PRINTING) printf("oldGradJastrow_x     = %15.15f\n", S[oldGradientJastrow]);
+		if (PRINTING) printf("oldGradJastrow_y     = %15.15f\n", S[oldGradientJastrow+1]);
+		if (PRINTING) printf("oldLaplacianJastrow  = %15.15f\n", S[oldLaplacianJastrow]);
+	}
+	__syncthreads();
+ 
+	// This calculates the Force. It requires the first two threads.
+	updateForce(oldDoubleGradientSlater, oldSlaterUpDeterminant, oldGradientJastrow, oldJastrow, oldForce);
+	if (tx==0) {
+		if (PRINTING) printf("oldForce_x       = %15.15f\n", S[oldForce]);
+		if (PRINTING) printf("oldForce_y       = %15.15f\n", S[oldForce+1]);
+	}
+	__syncthreads();
+
+
+	////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+	////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+	////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+	for (int cycle = 0; cycle < CYCLES; cycle++) {
+		if (PRINTING) printf("\n");
+		if (tx==0) {
+			if (PRINTING) printf("************** CYCLE %d **************\n", cycle);
+			if (PRINTING) printf("%s\n", parityReversal ? "true" : "false");
+		}
+		if (parityReversal == false) {
+			if ((currentlyMovedElectron&1)==0) {
+				moveElectron(oldPosition, oldMagnitude, newPosition, newMagnitude, oldDoubleGradientSlater, oldSlaterUpDeterminant,   oldGradientJastrow, oldJastrow, oldForce, currentlyMovedElectron, &RNG_state);
+			} else {
+				moveElectron(oldPosition, oldMagnitude, newPosition, newMagnitude, oldDoubleGradientSlater, oldSlaterDownDeterminant, oldGradientJastrow, oldJastrow, oldForce, currentlyMovedElectron, &RNG_state);	
+			}
+			__syncthreads();
+
+
+			initializeSlaterMatrices(newSlaterUp, newSlaterDown, newPosition, newMagnitude, k);
+			__syncthreads();
+			if ((currentlyMovedElectron&1)==0) {
+				if (tx==0) if (PRINTING) printf("Now calling slaterDet function on newPosition: UP.\n");
+				slaterDeterminantAndGradientAndLaplacian(newSlaterUp,   newPosition, newMagnitude, newSlaterUpDeterminant,   newDoubleGradientSlater, newLaplacianSlater, k, (currentlyMovedElectron>>1), true); 
+				S[newSlaterDownDeterminant] = determinant_3x3(newSlaterDown);
+			} else {
+				if (tx==0) if (PRINTING) printf("Now calling slaterDet function on newPosition: DOWN.\n");
+				slaterDeterminantAndGradientAndLaplacian(newSlaterDown, newPosition, newMagnitude, newSlaterDownDeterminant, newDoubleGradientSlater, newLaplacianSlater, k, (currentlyMovedElectron>>1), true);
+				S[newSlaterUpDeterminant] = determinant_3x3(newSlaterUp);
+			}		
+			__syncthreads();
+			jastrowGradientAndLaplacian(newPosition, newJastrow, newGradientJastrow, newLaplacianJastrow, currentlyMovedElectron, beta, false);
+			__syncthreads();
+
+
+			if (tx==0) printf("currentlyMovedElectron : %d\n", currentlyMovedElectron);
+			if ((currentlyMovedElectron&1)==0) {
+				updateForce(newDoubleGradientSlater, newSlaterUpDeterminant,   newGradientJastrow, newJastrow, newForce); // this is needed for the green's function
+			} else {
+				updateForce(newDoubleGradientSlater, newSlaterDownDeterminant, newGradientJastrow, newJastrow, newForce); // this is needed for the green's function
+			}
+			__syncthreads();	
+
+
+			double gf = greensFunction(oldPosition, newPosition, oldForce, newForce, currentlyMovedElectron);
+			if (tx==0) {
+				double RHS;
+				double numerator   = S[newJastrow]; /
+				double denominator = S[oldJastrow];
+				if (currentlyMovedElectron&1 == 0) {
+					numerator   *= S[newSlaterUpDeterminant];
+					denominator *= S[oldSlaterUpDeterminant];
+				} else {
+					numerator   *= S[newSlaterDownDeterminant];
+					denominator *= S[oldSlaterDownDeterminant];
+				}
+				double ratio2 = numerator*numerator / (denominator*denominator);
+				//double gf = greensFunction(oldPosition, newPosition, oldForce, newForce, currentlyMovedElectron);
+				RHS = gf * ratio2;
+				if (curand_uniform_double(&RNG_state) <= RHS) {
+					parityReversal = !parityReversal;
+					accepted++;
+				}
+			}
+		} else { // new-old PARITY IS REVERSED BELOW : EXPECT EVERYTHING TO BE ALL CATTYWAMPUS
+			// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+			// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+			// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+			// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+			// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+			if ((currentlyMovedElectron&1)==0) {
+				moveElectron(newPosition, newMagnitude, oldPosition, oldMagnitude, newDoubleGradientSlater, newSlaterUpDeterminant,   newGradientJastrow, newJastrow, newForce, currentlyMovedElectron, &RNG_state);
+			} else {
+				moveElectron(newPosition, newMagnitude, oldPosition, oldMagnitude, newDoubleGradientSlater, newSlaterDownDeterminant, newGradientJastrow, newJastrow, newForce, currentlyMovedElectron, &RNG_state);	
+			}
+			__syncthreads();
+			// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+			initializeSlaterMatrices(oldSlaterUp, oldSlaterDown, oldPosition, oldMagnitude, k);
+			__syncthreads();
+			if ((currentlyMovedElectron&1)==0) {
+				slaterDeterminantAndGradientAndLaplacian(oldSlaterUp,   oldPosition, oldMagnitude, oldSlaterUpDeterminant,   oldDoubleGradientSlater, oldLaplacianSlater, k, (currentlyMovedElectron>>1), true); 
+				S[oldSlaterDownDeterminant] = determinant_3x3(oldSlaterDown);
+			} else {
+				slaterDeterminantAndGradientAndLaplacian(oldSlaterDown, oldPosition, oldMagnitude, oldSlaterDownDeterminant, oldDoubleGradientSlater, oldLaplacianSlater, k, (currentlyMovedElectron>>1), true);
+				S[oldSlaterUpDeterminant] = determinant_3x3(oldSlaterUp);
+			}		
+			__syncthreads();
+			// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+			jastrowGradientAndLaplacian(oldPosition, oldJastrow, oldGradientJastrow, oldLaplacianJastrow, currentlyMovedElectron, beta, false);
+			__syncthreads();
+			// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+			if (tx==0) printf("currentlyMovedElectron : %d\n", currentlyMovedElectron);
+			if ((currentlyMovedElectron&1)==0) {
+				updateForce(oldDoubleGradientSlater, oldSlaterUpDeterminant,   oldGradientJastrow, oldJastrow, oldForce); // this is needed for the green's function
+			} else {
+				updateForce(oldDoubleGradientSlater, oldSlaterDownDeterminant, oldGradientJastrow, oldJastrow, oldForce); // this is needed for the green's function
+			}
+			__syncthreads();	
+			// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+			double gf = greensFunction(newPosition, oldPosition, newForce, oldForce, currentlyMovedElectron);
+			if (tx==0) {
+				double RHS;
+				double numerator   = S[oldJastrow];
+				double denominator = S[newJastrow];
+
+				if (currentlyMovedElectron&1 == 0) {
+					numerator   *= S[oldSlaterUpDeterminant];
+					denominator *= S[newSlaterUpDeterminant];
+				} else {
+					numerator   *= S[oldSlaterDownDeterminant];
+					denominator *= S[newSlaterDownDeterminant];
+				}
+
+				double ratio2 = numerator*numerator / (denominator*denominator);
+				if (PRINTING) printf("ratio2    = %f\n", ratio2);
+				if (PRINTING) printf("GF  = %15.15f\n", gf);				
+				RHS = gf * ratio2;
+				if (PRINTING) printf("RHS = %15.15f\n", RHS);
+				if (curand_uniform_double(&RNG_state) <= RHS) {
+					if (PRINTING) printf("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! MOVE ACCEPTED !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
+					parityReversal = !parityReversal;
+					accepted++;
+				}
+			}
+			// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+			// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+			// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+			// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+			// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+		} // END PARITY REVERSAL !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+		parityReversal = __shfl(parityReversal, 0, 8);
+		if ((cycle+1) % (CYCLES/100) == 0) { // YOU NEED TO ACTUALLY DO THIS EVERY CYCLE TO UPDATE THE KINETIC ENERGY PROPERLY
+			if (tx==0) printf("  cycle=%d : ", cycle+1);
+			if (parityReversal == false) {
+				double kinetic;
+				// the entire memoization strategy here is foolish... blatently wrong to assume kinetic energy for unmoved particle is constant. 
+				// but more important things are broken; fixing this will matter once they are fixed
+				S[kineticEnergies + currentlyMovedElectron] = localKineticEnergy(oldSlaterUpDeterminant, oldDoubleGradientSlater, oldLaplacianSlater, oldJastrow, oldGradientJastrow, oldLaplacianJastrow);
+				kinetic = sumKineticEnergies();
+				if (tx==0) printf("k=%5.5f : ", kinetic);
+
+				double electronElectron;
+				electronElectron = electronElectronPotentialEnergy(oldPosition);
+				if (tx==0) printf("e=%5.5f : ", electronElectron);
+
+				double harmonicPotential;
+				harmonicPotential = harmonicPotentialEnergy(oldPosition);
+				if (tx==0) printf("p=%5.5f : ", harmonicPotential);
+
+				if (tx==0) printf("E=%f\n", electronElectron+harmonicPotential+kinetic);
+			} else {
+				double kinetic;
+				// the entire memoization strategy here is foolish... blatently wrong to assume kinetic energy for unmoved particle is constant. 
+				// but more important things are broken; fixing this will matter once they are fixed
+				S[kineticEnergies + currentlyMovedElectron] = localKineticEnergy(newSlaterUpDeterminant, newDoubleGradientSlater, newLaplacianSlater, newJastrow, newGradientJastrow, newLaplacianJastrow);
+				kinetic = sumKineticEnergies();
+				if (tx==0) printf("k=%5.5f : ", kinetic);
+
+				double electronElectron;
+				electronElectron = electronElectronPotentialEnergy(newPosition);
+				if (tx==0) printf("e=%5.5f : ", electronElectron);
+
+				double harmonicPotential;
+				harmonicPotential = harmonicPotentialEnergy(newPosition);
+				if (tx==0) printf("p=%5.5f : ", harmonicPotential);
+
+				if (tx==0) printf("E=%f\n", electronElectron+harmonicPotential+kinetic);
+			} 
+		}
+		currentlyMovedElectron = updateCurrentElectron(currentlyMovedElectron); // keep this at the end of the iteration
+	}
+	////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+	////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+	////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////	
+	if (PRINTING) printf("\n");
+	if (tx==0) {
+		if (PRINTING) printf("oldSlaterDetUp     = %15.15f\n", S[oldSlaterUpDeterminant]);
+		if (PRINTING) printf("oldSlaterDetDown   = %15.15f\n", S[oldSlaterDownDeterminant]);
+		if (PRINTING) printf("oldGradSlater_x    = %15.15f\n", S[oldDoubleGradientSlater] );
+		if (PRINTING) printf("oldGradSlater_y    = %15.15f\n", S[oldDoubleGradientSlater+1]);
+		if (PRINTING) printf("oldLaplacianSlater = %15.15f\n", S[oldLaplacianSlater]);
+		if (PRINTING) printf("oldJastrow           = %15.15f\n", S[oldJastrow]);
+		if (PRINTING) printf("oldGradJastrow_x     = %15.15f\n", S[oldGradientJastrow]);
+		if (PRINTING) printf("oldGradJastrow_y     = %15.15f\n", S[oldGradientJastrow+1]);
+		if (PRINTING) printf("oldLaplacianJastrow  = %15.15f\n", S[oldLaplacianJastrow]);
+		if (PRINTING) printf("oldForce_x  = %f\n", S[oldForce]);
+		if (PRINTING) printf("oldForce_y  = %f\n", S[oldForce+1]);
+
+		if (PRINTING) printf("\n");
+
+		if (PRINTING) printf("newSlaterDetUp     = %15.15f\n", S[newSlaterUpDeterminant]);
+		if (PRINTING) printf("newSlaterDetDown   = %15.15f\n", S[newSlaterDownDeterminant]);
+		if (PRINTING) printf("newGradSlater_x    = %15.15f\n", S[newDoubleGradientSlater] );
+		if (PRINTING) printf("newGradSlater_y    = %15.15f\n", S[newDoubleGradientSlater+1]);
+		if (PRINTING) printf("newLaplacianSlater = %15.15f\n", S[newLaplacianSlater]);
+		if (PRINTING) printf("newJastrow           = %15.15f\n", S[newJastrow]);
+		if (PRINTING) printf("newGradJastrow_x     = %15.15f\n", S[newGradientJastrow]);
+		if (PRINTING) printf("newGradJastrow_y     = %15.15f\n", S[newGradientJastrow+1]);
+		if (PRINTING) printf("newLaplacianJastrow  = %15.15f\n", S[newLaplacianJastrow]);
+		if (PRINTING) printf("newForce_x  = %f\n", S[newForce]);
+		if (PRINTING) printf("newForce_y  = %f\n", S[newForce+1]);
+
+		if (PRINTING) printf("\n");
+	}	
+	if (tx<N) {
+		if (PRINTING) printf("dist[%d]=%f  ", tx, S[oldMagnitude+tx]);
+	}
+	if (tx==0) printf("\naccepted = %2.2f%%\n", 100.0*accepted/CYCLES);
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/*
+
+
+
+
+__device__ __forceinline__  double hermite (int order, double x) {
+    switch (order) {
+        case 0:
+            return 1.0;
+        case 1:
+            return x+x; 
+    }
+    printf("ERROR: hermite order %d (x=%f)\n", order, x);
+    return -1.0;
+}
+ 
+__device__ __forceinline__ bool sameSpin(int i, int j) {
+	return ((i&1) == (j&1));
+	//so the function will collapse...
+	//stupid text editor
+}
+
+__device__ __forceinline__ double a(int i, int j) {
+    if (sameSpin(i,j)) { // same spin
+    	return 1.0/3.0;
+    } else { // different spin
+        return 1.0;
+    }
+}
+
+__device__ __forceinline__ bool isUpSpin(int i) {
+	return ((tx & 1) == 0);
+	// stupid text editor
+}
+
+__device__ __forceinline__ double psi(int state, orbital) {
+	int nx,ny;
+	if (orbital == 1) { // orbitals are 0-indexed
+		ny = 1;
+	} else {
+		ny = 0;
+	}
+	if (orbital == 2) {
+		nx = 1;
+	} else {
+		nx = 0;
+	}
+	double m = S[state + magnitude + tx];
+	return hermite(nx, K * S[state + position + idx(tx,0)]) * hermite(ny, K * S[state + position + idx(tx,1)]) * exp(-0.5 * K2 * m*m); 
+}
+
+__device__ double determinant_3x3 (int offset) { 
+	double partial = 0.0;
+	if (tx == 0) {
+		partial = S[offset + 0]  *  (S[offset + 4]*S[offset + 8] - S[offset + 5]*S[offset + 7]);
+	}
+	if (tx == 1) {
+		partial = S[offset + 1]  *  (S[offset + 3]*S[offset + 8] - S[offset + 5]*S[offset + 6]);
+	}
+	if (tx == 2) {
+		partial = S[offset + 2]  *  (S[offset + 3]*S[offset + 7] - S[offset + 6]*S[offset + 4]);		
+	}
+	__syncthreads();
+	partial += __shfl_down(partial, 2);
+	partial -= __shfl_down(partial, 1);
+	// tx=0 should now have the right partial. everything else is garbage.
+	return __shfl(partial, 0);
+}
+
+
+__device__ void initializePosition(curandState *RNG_state, int state) {
+	if (tx<N) {
+		double r = 1.0 + curand_normal_double(RNG_state);
+		double theta = curand_uniform_double(RNG_state) * 2 * PI;
+		S[state + position + idx(tx,0)] = r*cos(theta);
+		S[state + position + idx(tx,1)] = r*sin(theta);
+		S[state + magnitude + tx] = abs(r);
+	}
+}
+
+__device__ void setSlaterMatrices(int state) {
+	if (tx<N) {
+		int mySlater;
+		if (isUpSpin(tx)) { // that is to say, all EVEN threads; including the 0th thread
+			mySlater = slaterUp; // thus EVEN threads are UP threads...
+		} else { // all ODD threads
+			mySlater = slaterDown; // ... and ODD threads are DOWN threads
+		}
+		for (int orbital=0; orbital<N/2; orbital++) {
+			S[state + mySlater + sIdx()] = psi(state, orbital); 
+		}
+	}
+}
+
+__device__ void setSlaterDeterminants(int state) {
+	S[state + slaterUpDet]   = determinant_3x3(state + slaterUp);
+	S[state + slaterDownDet] = determinant_3x3(state + slaterDown);
+}
+
+
+
+
+__device__ bool MC_Trial(int oldState, int newState) {
+
+
+	return accept;
+}
+
+__global__ void VMC_Kernel2(double alpha, double beta) {
+	int accepted = 0;
+	bool parityReversal = false;
+
+	int UNIQUE_ID = tx; // this must be unique for every thread in every block **for every run** before it is useful!
+	curandState RNG_state;
+	curand_init(SEED, UNIQUE_ID, 0, &RNG_state);
+
+	initializePosition(&RNG_state, stateA);
+	setSlaterMatrices(stateA);
+	setWaveFunction(stateA, particle, dimension, step);
+	//setQuantumForce(stateA);
+
+	for (int cycle = 0; cycle < CYCLES; cycle++) {
+		if (parityReversal) {
+			if (MC_Trial(stateB, stateA)) parityReversal = !parityReversal;
+		} else {
+			if (MC_Trial(stateA, stateB)) parityReversal = !parityReversal;
+		}
+		if (parityReversal) {
+			recordEnergy(stateB);
+		} else {
+			recordEnergy(stateA);
+		}
+	}
+}
+
+*/
+
+void MC_Sample_Variations (int dimensions) {
+//	dim3 bpg(16*8);
+//	dim3 tpb(32);
+//	Test_Kernel <<< bpg, tpb >>> ();
+
+	dim3 threadsPerBlock(8,1);
+	cudaDeviceSynchronize();
+	cudaCheckErrors("trying to sync before kernel launch");
+	printf("sizeOfSM: %d\n", sizeOfSM);
+	VMC_Kernel <<< 1, threadsPerBlock, sizeOfSM*sizeof(double)>>> (ALPHA, BETA, sqrt(ALPHA*OMEGA));
+//	VMC_Kernel2 <<<1, threadsPerBlock, sizeOfSM2*sizeOf(double)>>> (ALPHA, BETA);
+	cudaCheckErrors("launching kernel");
+	cudaDeviceSynchronize();
+	cudaCheckErrors("trying to sync after kernel");
+	return;
+}

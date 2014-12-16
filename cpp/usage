@@ -1,0 +1,1 @@
+g++ -fopenmp -DARMA_NO_DEBUG main.cpp -o monte_carlo lib.cpp mc_sampling.cpp E_pot.cpp wave.cpp Jas.cpp Slater1.cpp Hermite1.cpp gaussiandeviate.cpp Random.cpp -larmadillo -llapack -lblas
